@@ -15,6 +15,7 @@ from app.schemas import AssociatePapersIn, SearchTaskCreate, SearchTaskUpdate, T
 from app.services import serializers
 from app.services.log_service import log_event
 from app.services.paper_service import list_papers
+from app.services import capture_service
 from app.services.search_task_service import (
     cancel_task,
     pause_task,
@@ -162,6 +163,22 @@ def do_cancel(task_id: str, db: Session = Depends(get_db)):
 @router.post("/{task_id}/retry")
 def do_retry(task_id: str, db: Session = Depends(get_db)):
     return ok(retry_task(db, task_id), message="任务已重新执行")
+
+
+@router.post("/{task_id}/silent-capture")
+def start_silent_capture_endpoint(task_id: str, db: Session = Depends(get_db)):
+    session = capture_service.start_silent_capture(db, task_id)
+    return ok(session, message="已启动静默抓取")
+
+
+@router.get("/{task_id}/silent-capture")
+def get_silent_capture_endpoint(task_id: str, db: Session = Depends(get_db)):
+    return ok(capture_service.get_silent_capture(db, task_id))
+
+
+@router.post("/{task_id}/silent-capture/cancel")
+def cancel_silent_capture_endpoint(task_id: str, db: Session = Depends(get_db)):
+    return ok(capture_service.cancel_silent_capture(db, task_id), message="已取消")
 
 
 @router.get("/{task_id}/guide")

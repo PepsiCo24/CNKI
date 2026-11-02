@@ -47,7 +47,6 @@ def _create_task(client, **overrides):
     return res.json()["data"]["task"]
 
 
-@pytest.mark.skip(reason="HTTP routes are added in Task 4")
 def test_silent_capture_requires_account(client, db):
     task = _create_task(client)
     res = client.post(f"/api/search-tasks/{task['id']}/silent-capture")
@@ -56,7 +55,6 @@ def test_silent_capture_requires_account(client, db):
     assert "账号" in body.get("message", "") or "账号" in str(body)
 
 
-@pytest.mark.skip(reason="HTTP routes are added in Task 4")
 def test_silent_capture_starts_waiting_when_ready(client, db, tmp_path):
     from app.services.settings_service import SettingsService
     from app.core.config import get_settings
@@ -72,6 +70,25 @@ def test_silent_capture_starts_waiting_when_ready(client, db, tmp_path):
     data = res.json()["data"]
     assert data["stage"] == "waiting_files"
     assert data["progress"] < 20
+
+
+def test_silent_capture_api_get_and_cancel(client, db, tmp_path):
+    from app.services.settings_service import SettingsService
+
+    incoming = tmp_path / "imports"
+    incoming.mkdir()
+    SettingsService(db).set("cnki.account_username", "u1")
+    SettingsService(db).set("data.import_dir", str(incoming))
+    db.commit()
+    task = _create_task(client)
+    started = client.post(f"/api/search-tasks/{task['id']}/silent-capture")
+    assert started.status_code == 200
+    got = client.get(f"/api/search-tasks/{task['id']}/silent-capture")
+    assert got.status_code == 200
+    assert got.json()["data"]["stage"] == "waiting_files"
+    cancelled = client.post(f"/api/search-tasks/{task['id']}/silent-capture/cancel")
+    assert cancelled.status_code == 200
+    assert cancelled.json()["data"]["stage"] == "cancelled"
 
 
 def test_validate_and_start_service(client, db, tmp_path):
