@@ -3,6 +3,7 @@ import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { importsApi, settingsApi, tasksApi, type TaskPayload } from '@/api'
+import { ApiError } from '@/api/client'
 import type { CaptureCounts, CaptureSession, PaperSummary, RetrievalGuide, SearchTask } from '@/types'
 import PageHeader from '@/components/PageHeader.vue'
 import StatusTag from '@/components/StatusTag.vue'
@@ -35,6 +36,7 @@ const captureSession = ref<CaptureSession | null>(null)
 const captureBusy = ref(false)
 const captureTerminalNotified = ref(false)
 let capturePolling: number | null = null
+let captureSyncToken = 0
 const pollTimer = window.setInterval(() => {
   if (detailVisible.value) refreshDetail(true)
 }, 5000)
@@ -173,7 +175,11 @@ watch(dateRange, (value) => {
 })
 
 watch(detailVisible, (visible) => {
-  if (!visible) stopCapturePolling()
+  if (!visible) {
+    stopCapturePolling()
+    return
+  }
+  void syncCapturePolling()
 })
 
 async function loadTasks() {
@@ -233,15 +239,17 @@ async function submitEdit() {
 }
 
 async function openDetail(taskId: string) {
+  const drawerWasOpen = detailVisible.value
   stopCapturePolling()
   captureSession.value = null
   captureTerminalNotified.value = false
   activeTaskId.value = taskId
-  detailVisible.value = true
   currentTask.value = null
   papers.value = []
   logs.value = []
+  detailVisible.value = true
   await refreshDetail()
+  if (drawerWasOpen && detailVisible.value) await syncCapturePolling()
 }
 
 async function refreshDetail(silent = false) {
@@ -357,8 +365,43 @@ function stopCapturePolling() {
 function startCapturePolling() {
   stopCapturePolling()
   capturePolling = window.setInterval(() => {
-    pollCaptureSession()
+    void pollCaptureSession()
   }, 1500)
+}
+
+function ensureCapturePolling() {
+  if (capturePolling != null) return
+  startCapturePolling()
+}
+
+function isMissingCapture(error: unknown) {
+  return error instanceof ApiError && error.status === 404
+}
+
+async function syncCapturePolling() {
+  if (!detailVisible.value) return
+  const id = activeTaskId.value || currentTask.value?.id
+  if (!id) return
+  const token = ++captureSyncToken
+  try {
+    const session = await tasksApi.silentCaptureGet(id, { skipErrorToast: true })
+    if (token !== captureSyncToken || !detailVisible.value || activeTaskId.value !== id) return
+    if (CAPTURE_TERMINAL_STAGES.has(session.stage)) {
+      captureSession.value = session
+      captureTerminalNotified.value = true
+      stopCapturePolling()
+      return
+    }
+    captureSession.value = session
+    startCapturePolling()
+  } catch (error) {
+    if (token !== captureSyncToken || !detailVisible.value || activeTaskId.value !== id) return
+    if (isMissingCapture(error)) {
+      stopCapturePolling()
+      return
+    }
+    ensureCapturePolling()
+  }
 }
 
 function applyCaptureSession(session: CaptureSession) {
@@ -379,13 +422,19 @@ function applyCaptureSession(session: CaptureSession) {
 }
 
 async function pollCaptureSession() {
-  const id = currentTask.value?.id || activeTaskId.value
-  if (!id) return
+  const id = activeTaskId.value || currentTask.value?.id
+  if (!id || !detailVisible.value) return
   try {
-    const session = await tasksApi.silentCaptureGet(id)
+    const session = await tasksApi.silentCaptureGet(id, { skipErrorToast: true })
+    if (!detailVisible.value || activeTaskId.value !== id) return
     applyCaptureSession(session)
-  } catch {
-    stopCapturePolling()
+  } catch (error) {
+    if (!detailVisible.value || activeTaskId.value !== id) return
+    if (isMissingCapture(error)) {
+      stopCapturePolling()
+      return
+    }
+    ensureCapturePolling()
   }
 }
 

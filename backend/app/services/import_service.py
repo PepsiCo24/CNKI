@@ -8,7 +8,7 @@ from pathlib import Path
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.core.constants import JobStatus
+from app.core.constants import JobStatus, TaskStatus
 from app.core.errors import NotFoundError
 from app.core.logging import get_logger
 from app.core.utils import safe_filename, utcnow
@@ -285,7 +285,11 @@ def scan_directory(db: Session, import_job_id: str, directory: str, task_id: str
     job.status = JobStatus.COMPLETED
     job.finished_at = utcnow()
     if task:
-        task.status = "awaiting_import"
+        committed = db.query(SearchTask.status).filter(SearchTask.id == task.id).scalar()
+        if committed in (TaskStatus.CANCELLED, TaskStatus.PAUSED):
+            task.status = committed
+        elif task.status not in (TaskStatus.CANCELLED, TaskStatus.PAUSED):
+            task.status = TaskStatus.AWAITING_IMPORT
         task.last_run_at = utcnow()
         refresh_counters(db, task.id)
     db.commit()

@@ -149,9 +149,12 @@ def _ready_task(db, tmp_path, **overrides):
 def test_start_enqueues_silent_capture_job(db, tmp_path):
     from app.models import BackgroundJob
     from app.services import capture_service
+    from app.services.settings_service import SettingsService
 
     task, _ = _ready_task(db, tmp_path)
+    assert not SettingsService(db).get("data.watch_enabled")
     out = capture_service.start_silent_capture(db, task.id)
+    assert not SettingsService(db).get("data.watch_enabled")
     assert out["stage"] == "waiting_files"
     assert out["progress"] < 20
     assert out["wait_timeout_seconds"] == 1800
@@ -162,6 +165,7 @@ def test_start_enqueues_silent_capture_job(db, tmp_path):
     job = db.get(BackgroundJob, session.background_job_id)
     assert job is not None
     assert job.job_type == JobType.SILENT_CAPTURE
+    assert job.task_id == task.id
     assert job.payload["session_id"] == session.id
     assert job.payload["task_id"] == task.id
 
@@ -614,3 +618,169 @@ def test_silent_capture_cancel_during_scan_sticks(db, tmp_path, sample_ris, monk
     assert latest["stage"] == "cancelled"
     assert latest["status"] == "cancelled"
     assert latest["finished_at"]
+
+
+def test_task_cancel_stops_silent_capture(db, tmp_path, sample_ris):
+    import shutil
+
+    from app.core.constants import JobStatus, TaskStatus
+    from app.models import BackgroundJob, Paper
+    from app.services import capture_service
+    from app.services.search_task_service import cancel_task
+    from app.services.settings_service import SettingsService
+    from app.tasks import handlers
+
+    task, incoming = _ready_task(db, tmp_path)
+    assert not SettingsService(db).get("data.watch_enabled")
+    out = capture_service.start_silent_capture(db, task.id)
+    assert not SettingsService(db).get("data.watch_enabled")
+    session = db.get(CaptureSession, out["id"])
+    job = db.get(BackgroundJob, session.background_job_id)
+    assert job is not None
+    assert job.task_id == task.id
+    shutil.copy(sample_ris, incoming / sample_ris.name)
+
+    cancel_task(db, task.id)
+    db.refresh(session)
+    db.refresh(job)
+    db.refresh(task)
+    assert task.status == TaskStatus.CANCELLED
+    assert session.stage == "cancelled"
+    assert session.status == "cancelled"
+    assert job.cancel_requested
+    assert job.status in (JobStatus.CANCELLED, JobStatus.CANCELLING)
+
+    with pytest.raises(handlers.JobCancelled):
+        handlers.handle_silent_capture(job.id, {"session_id": session.id, "task_id": task.id})
+    db.refresh(task)
+    db.refresh(session)
+    assert task.status == TaskStatus.CANCELLED
+    assert session.stage == "cancelled"
+    assert db.query(Paper).count() == 0
+
+
+def test_task_pause_stops_silent_capture(db, tmp_path):
+    from app.core.constants import TaskStatus
+    from app.models import BackgroundJob
+    from app.services import capture_service
+    from app.services.search_task_service import pause_task
+
+    task, _incoming = _ready_task(db, tmp_path)
+    out = capture_service.start_silent_capture(db, task.id)
+    session = db.get(CaptureSession, out["id"])
+    job = db.get(BackgroundJob, session.background_job_id)
+    pause_task(db, task.id)
+    db.refresh(session)
+    db.refresh(job)
+    db.refresh(task)
+    assert task.status == TaskStatus.PAUSED
+    assert session.stage == "cancelled"
+    assert session.status == "cancelled"
+    assert job is not None
+    assert job.task_id == task.id
+    assert job.status == "cancelled"
+    assert job.cancel_requested
+
+
+def test_wait_loop_stops_when_task_paused(db, tmp_path, sample_ris):
+    import shutil
+
+    from app.core.constants import TaskStatus
+    from app.models import BackgroundJob, Paper
+    from app.services import capture_service
+    from app.tasks import handlers
+
+    task, incoming = _ready_task(db, tmp_path)
+    out = capture_service.start_silent_capture(db, task.id)
+    session = db.get(CaptureSession, out["id"])
+    bg = db.get(BackgroundJob, session.background_job_id)
+    shutil.copy(sample_ris, incoming / sample_ris.name)
+    task.status = TaskStatus.PAUSED
+    db.commit()
+
+    with pytest.raises(handlers.JobCancelled):
+        handlers.handle_silent_capture(bg.id, {"session_id": session.id, "task_id": task.id})
+    db.refresh(session)
+    db.refresh(task)
+    assert session.stage == "cancelled"
+    assert session.status == "cancelled"
+    assert task.status == TaskStatus.PAUSED
+    assert db.query(Paper).count() == 0
+
+
+def test_scan_and_post_scan_keep_cancelled_and_paused(db, tmp_path, sample_ris):
+    import shutil
+
+    from app.core.constants import JobStatus, TaskStatus
+    from app.models import ImportJob
+    from app.services import capture_service
+    from app.services.import_service import scan_directory
+
+    task, incoming = _ready_task(db, tmp_path)
+    shutil.copy(sample_ris, incoming / sample_ris.name)
+    task.status = TaskStatus.CANCELLED
+    db.commit()
+    cancelled_job = ImportJob(
+        job_type="folder_scan",
+        status=JobStatus.PENDING,
+        source_path=str(incoming),
+        task_id=task.id,
+    )
+    db.add(cancelled_job)
+    db.commit()
+    scan_directory(db, cancelled_job.id, str(incoming), task.id)
+    db.refresh(task)
+    assert task.status == TaskStatus.CANCELLED
+
+    task.status = TaskStatus.PAUSED
+    db.commit()
+    paused_job = ImportJob(
+        job_type="folder_scan",
+        status=JobStatus.PENDING,
+        source_path=str(incoming),
+        task_id=task.id,
+    )
+    db.add(paused_job)
+    db.commit()
+    scan_directory(db, paused_job.id, str(incoming), task.id)
+    db.refresh(task)
+    assert task.status == TaskStatus.PAUSED
+
+    out = capture_service.start_silent_capture(db, task.id)
+    session = db.get(CaptureSession, out["id"])
+    task.status = TaskStatus.PAUSED
+    done = ImportJob(
+        job_type="folder_scan",
+        status=JobStatus.COMPLETED,
+        source_path=str(incoming),
+        task_id=task.id,
+        total=1,
+        processed=1,
+        imported=1,
+        detail={"skipped": 0},
+    )
+    db.add(done)
+    db.flush()
+    session.import_job_id = done.id
+    session.stage = CaptureStage.IMPORTING
+    db.commit()
+    capture_service.refresh_session_progress(db, session)
+    db.refresh(task)
+    db.refresh(session)
+    assert task.status == TaskStatus.PAUSED
+    assert session.stage == "cancelled"
+    assert session.status == "cancelled"
+
+
+def test_start_does_not_enable_global_watch(db, tmp_path, monkeypatch):
+    from app.services import capture_service, watch_service
+    from app.services.settings_service import SettingsService
+
+    def fail_start(self, directory=None):
+        raise AssertionError("silent capture must not start the folder watcher")
+
+    monkeypatch.setattr(watch_service.WatchService, "start", fail_start)
+    task, _incoming = _ready_task(db, tmp_path)
+    assert not SettingsService(db).get("data.watch_enabled")
+    capture_service.start_silent_capture(db, task.id)
+    assert SettingsService(db).get("data.watch_enabled") is False

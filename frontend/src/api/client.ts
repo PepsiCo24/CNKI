@@ -1,6 +1,12 @@
 import axios, { type AxiosInstance } from 'axios'
 import { ElMessage } from 'element-plus'
 
+declare module 'axios' {
+  interface AxiosRequestConfig {
+    skipErrorToast?: boolean
+  }
+}
+
 export class ApiError extends Error {
   code: string
   detail: Record<string, unknown>
@@ -38,12 +44,13 @@ http.interceptors.response.use(
     if (body && body.success === false) {
       const error = body.error ?? {}
       const apiError = new ApiError(error.message || '请求失败', error.code, error.detail, response.status)
-      toast(apiError.message)
+      if (!response.config.skipErrorToast) toast(apiError.message)
       return Promise.reject(apiError)
     }
     return body?.data
   },
   (error) => {
+    const silent = Boolean(error.config?.skipErrorToast)
     if (error.response) {
       const body = error.response.data ?? {}
       const payload = body.error ?? {}
@@ -52,16 +59,16 @@ http.interceptors.response.use(
         (typeof body.detail === 'string' ? body.detail : '') ||
         `请求失败（${error.response.status}）`
       const apiError = new ApiError(message, payload.code || 'http_error', payload.detail || {}, error.response.status)
-      toast(message)
+      if (!silent) toast(message)
       return Promise.reject(apiError)
     }
     if (error.code === 'ECONNABORTED') {
       const apiError = new ApiError('请求超时，请检查后端服务或模型接口', 'timeout')
-      toast(apiError.message)
+      if (!silent) toast(apiError.message)
       return Promise.reject(apiError)
     }
     const message = '无法连接后端服务，请确认 FastAPI 已启动（127.0.0.1:8000）'
-    toast(message)
+    if (!silent) toast(message)
     return Promise.reject(new ApiError(message, 'network_error'))
   },
 )

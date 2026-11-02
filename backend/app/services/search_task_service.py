@@ -121,6 +121,9 @@ def pause_task(db: Session, task_id: str) -> dict[str, Any]:
     for job in jobs:
         job.status = JobStatus.CANCELLED
         job.finished_at = utcnow()
+    from app.services.capture_service import halt_capture_for_task_control
+
+    halt_capture_for_task_control(db, task.id)
     db.commit()
     log_event(db, "任务已暂停", task_id=task.id, commit=True)
     return serializers.task_out(task)
@@ -155,6 +158,9 @@ def cancel_task(db: Session, task_id: str) -> dict[str, Any]:
         job.status = JobStatus.CANCELLED if job.status == JobStatus.PENDING else JobStatus.CANCELLING
         job.cancel_requested = 1
         job.finished_at = utcnow() if job.status == JobStatus.CANCELLED else None
+    from app.services.capture_service import halt_capture_for_task_control
+
+    halt_capture_for_task_control(db, task.id)
     db.commit()
     log_event(db, "任务已取消", task_id=task.id, level="warning", commit=True)
     return serializers.task_out(task)

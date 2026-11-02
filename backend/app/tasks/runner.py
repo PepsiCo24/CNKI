@@ -223,6 +223,12 @@ class JobRunner:
                 job.message = message
             if status == JobStatus.COMPLETED:
                 job.error = ""
+            if status == JobStatus.CANCELLED and job.job_type == JobType.SILENT_CAPTURE:
+                from app.services.capture_service import ensure_session_cancelled
+
+                session_id = str((job.payload or {}).get("session_id") or "")
+                if session_id:
+                    ensure_session_cancelled(db, session_id)
             db.commit()
             if status == JobStatus.COMPLETED:
                 logger.info("Job %s completed", job_id)

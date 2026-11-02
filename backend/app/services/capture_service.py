@@ -94,7 +94,6 @@ def start_silent_capture(db: Session, task_id: str) -> dict:
         return _present_session(db, existing)
     validate_silent_capture_prerequisites(db, task)
     timeout = int(SettingsService(db).get("cnki.capture_wait_timeout") or 1800)
-    SettingsService(db).set("data.watch_enabled", True)
     session = CaptureSession(
         task_id=task.id,
         status=JobStatus.RUNNING,
@@ -112,6 +111,7 @@ def start_silent_capture(db: Session, task_id: str) -> dict:
         JobType.SILENT_CAPTURE,
         {"session_id": session.id, "task_id": task.id},
         dedupe_key=f"silent_capture:{task.id}",
+        task_id=task.id,
         priority=3,
         commit=False,
     )
@@ -225,6 +225,61 @@ def _pending_parse_count(db: Session, task_id: str) -> int:
     return pending
 
 
+def _committed_task_status(db: Session, task_id: str) -> str | None:
+    """Read status from the database without expiring pending counter edits."""
+    return db.query(SearchTask.status).filter(SearchTask.id == task_id).scalar()
+
+
+def _capture_blocked_by_task(db: Session, task_id: str) -> bool:
+    """True when task cancel/pause must stop capture without rewriting that status."""
+    return _committed_task_status(db, task_id) in (TaskStatus.CANCELLED, TaskStatus.PAUSED)
+
+
+def _align_controlled_task_status(db: Session, task: SearchTask) -> None:
+    """Keep a cancelled or paused task from being committed back as a newer status."""
+    committed = _committed_task_status(db, task.id)
+    if committed in (TaskStatus.CANCELLED, TaskStatus.PAUSED):
+        task.status = committed
+
+
+def halt_capture_for_task_control(db: Session, task_id: str) -> None:
+    """Stop an in-flight silent capture when the owning task is cancelled or paused.
+
+    Does not change SearchTask.status; the task control path owns that field.
+    """
+    session = get_active_session(db, task_id)
+    if session is None:
+        return
+    session.stage = CaptureStage.CANCELLED
+    session.status = JobStatus.CANCELLED
+    session.finished_at = utcnow()
+    session.message = STAGE_MESSAGES[CaptureStage.CANCELLED]
+    if session.background_job_id:
+        job = db.get(BackgroundJob, session.background_job_id)
+        if job and job.status not in (JobStatus.COMPLETED, JobStatus.FAILED):
+            if job.status == JobStatus.RUNNING:
+                job.status = JobStatus.CANCELLING
+            elif job.status == JobStatus.PENDING:
+                job.status = JobStatus.CANCELLED
+                job.finished_at = job.finished_at or utcnow()
+            job.cancel_requested = 1
+    log_event(
+        db,
+        "静默抓取已随任务取消或暂停而停止",
+        task_id=task_id,
+        detail={"session_id": session.id},
+        commit=False,
+    )
+
+
+def ensure_session_cancelled(db: Session, session_id: str) -> None:
+    """Mark a still-open capture cancelled. No-op once the session is terminal."""
+    session = db.get(CaptureSession, session_id)
+    if session is None or session.stage in TERMINAL_STAGES:
+        return
+    _finish_session(db, session, CaptureStage.CANCELLED)
+
+
 def _finish_session(db: Session, session: CaptureSession, stage: str, *, error: str = "") -> None:
     session.stage = stage
     session.message = STAGE_MESSAGES[stage]
@@ -238,6 +293,8 @@ def _finish_session(db: Session, session: CaptureSession, stage: str, *, error: 
     else:
         session.status = JobStatus.COMPLETED
     task = db.get(SearchTask, session.task_id)
+    if task is not None:
+        _align_controlled_task_status(db, task)
     if task and task.status == TaskStatus.RUNNING and stage in (
         CaptureStage.CANCELLED,
         CaptureStage.TIMED_OUT,
@@ -259,6 +316,9 @@ def tick_wait_or_scan(db: Session, session: CaptureSession, *, now: float | None
     """
     db.refresh(session)
     if session.stage == CaptureStage.CANCELLED:
+        return "cancelled"
+    if _capture_blocked_by_task(db, session.task_id):
+        _finish_session(db, session, CaptureStage.CANCELLED)
         return "cancelled"
     bg = db.get(BackgroundJob, session.background_job_id) if session.background_job_id else None
     if bg and bg.cancel_requested:
@@ -311,6 +371,9 @@ def refresh_session_progress(db: Session, session: CaptureSession, import_job: I
     if session.stage in TERMINAL_STAGES:
         db.commit()
         return
+    if _capture_blocked_by_task(db, session.task_id):
+        _finish_session(db, session, CaptureStage.CANCELLED)
+        return
     if import_job is not None and import_job.status == JobStatus.FAILED:
         session.progress = map_import_progress(int(import_job.processed or 0), int(import_job.total or 0))
         session.stage = CaptureStage.FAILED
@@ -334,6 +397,8 @@ def refresh_session_progress(db: Session, session: CaptureSession, import_job: I
             session.progress = 100.0
             session.finished_at = utcnow()
             session.message = STAGE_MESSAGES[CaptureStage.READY_FOR_REVIEW]
+            if task is not None:
+                _align_controlled_task_status(db, task)
             if task and task.status == TaskStatus.RUNNING:
                 task.status = TaskStatus.AWAITING_IMPORT
             log_event(
