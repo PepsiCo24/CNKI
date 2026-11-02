@@ -480,3 +480,120 @@ async def test_runner_dispatches_silent_capture(client, db, tmp_path, sample_ris
     db.refresh(bg)
     assert session.stage == "ready_for_review"
     assert bg.status == "completed"
+
+
+def test_get_silent_capture_maps_in_progress_scan(db, tmp_path):
+    from app.core.constants import JobStatus
+    from app.models import BackgroundJob, ImportJob
+    from app.services import capture_service
+
+    task, incoming = _ready_task(db, tmp_path)
+    out = capture_service.start_silent_capture(db, task.id)
+    session = db.get(CaptureSession, out["id"])
+    job = ImportJob(
+        job_type="folder_scan",
+        status=JobStatus.RUNNING,
+        source_path=str(incoming),
+        task_id=task.id,
+        total=4,
+        processed=2,
+        detail={"origin": "silent_capture", "skipped": 0},
+    )
+    db.add(job)
+    db.flush()
+    session.import_job_id = job.id
+    session.stage = CaptureStage.IMPORTING
+    session.progress = 35
+    db.commit()
+
+    got = capture_service.get_silent_capture(db, task.id)
+    assert got["stage"] == "importing"
+    assert got["status"] == "running"
+    assert got["progress"] == 55.0
+    assert got["finished_at"] is None
+
+    again = capture_service.start_silent_capture(db, task.id)
+    assert again["id"] == out["id"]
+    assert again["stage"] == "importing"
+    assert again["progress"] == 55.0
+    assert db.query(BackgroundJob).filter(BackgroundJob.job_type == JobType.SCAN_FOLDER).count() == 0
+
+
+def test_silent_capture_pdf_stays_ai_queued_until_parse_drains(db, tmp_path, sample_pdf):
+    import shutil
+
+    from app.core.constants import JobStatus, ReviewStatus
+    from app.models import BackgroundJob, Paper
+    from app.services import capture_service
+    from app.tasks import handlers
+
+    task, incoming = _ready_task(db, tmp_path)
+    out = capture_service.start_silent_capture(db, task.id)
+    session = db.get(CaptureSession, out["id"])
+    bg = db.get(BackgroundJob, session.background_job_id)
+    shutil.copy(sample_pdf, incoming / sample_pdf.name)
+
+    handlers.handle_silent_capture(bg.id, {"session_id": session.id, "task_id": task.id})
+    db.refresh(session)
+    papers = db.query(Paper).filter(Paper.is_deleted.is_(False)).all()
+    parse_jobs = (
+        db.query(BackgroundJob)
+        .filter(BackgroundJob.job_type == JobType.PARSE_PAPER, BackgroundJob.status == JobStatus.PENDING)
+        .all()
+    )
+
+    assert papers
+    assert session.stage == "ai_queued"
+    assert session.status == "running"
+    assert session.finished_at is None
+    assert session.stage != "ready_for_review"
+    assert parse_jobs
+    assert all(paper.review_status != ReviewStatus.INCLUDED for paper in papers)
+    assert db.query(BackgroundJob).filter(BackgroundJob.job_type == JobType.SCAN_FOLDER).count() == 0
+
+    mid = capture_service.get_silent_capture(db, task.id)
+    assert mid["stage"] == "ai_queued"
+    assert mid["status"] == "running"
+    assert mid["finished_at"] is None
+
+    for job in parse_jobs:
+        job.status = JobStatus.COMPLETED
+    db.commit()
+    drained = capture_service.get_silent_capture(db, task.id)
+    assert drained["stage"] == "ready_for_review"
+    assert drained["status"] == "completed"
+    assert drained["finished_at"]
+    papers = db.query(Paper).filter(Paper.is_deleted.is_(False)).all()
+    assert all(paper.review_status != ReviewStatus.INCLUDED for paper in papers)
+
+
+def test_silent_capture_cancel_during_scan_sticks(db, tmp_path, sample_ris, monkeypatch):
+    import shutil
+
+    from app.models import BackgroundJob
+    from app.services import capture_service, import_service
+    from app.tasks import handlers
+
+    task, incoming = _ready_task(db, tmp_path)
+    out = capture_service.start_silent_capture(db, task.id)
+    session = db.get(CaptureSession, out["id"])
+    bg = db.get(BackgroundJob, session.background_job_id)
+    shutil.copy(sample_ris, incoming / sample_ris.name)
+
+    def scan_then_cancel(scan_db, import_job_id, directory, task_id):
+        capture_service.cancel_silent_capture(scan_db, task_id)
+        return import_service.scan_directory(scan_db, import_job_id, directory, task_id)
+
+    monkeypatch.setattr(capture_service, "scan_directory", scan_then_cancel)
+    handlers.handle_silent_capture(bg.id, {"session_id": session.id, "task_id": task.id})
+    db.refresh(session)
+    assert session.stage == "cancelled"
+    assert session.status == "cancelled"
+    assert session.finished_at is not None
+    assert session.message == "已取消静默抓取"
+    assert session.progress != 100
+
+    latest = capture_service.get_silent_capture(db, task.id)
+    assert latest["stage"] == "cancelled"
+    assert latest["status"] == "cancelled"
+    assert latest["finished_at"]

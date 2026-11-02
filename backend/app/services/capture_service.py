@@ -91,7 +91,7 @@ def start_silent_capture(db: Session, task_id: str) -> dict:
         raise NotFoundError("检索任务不存在")
     existing = get_active_session(db, task_id)
     if existing:
-        return serializers.capture_session_out(existing)
+        return _present_session(db, existing)
     validate_silent_capture_prerequisites(db, task)
     timeout = int(SettingsService(db).get("cnki.capture_wait_timeout") or 1800)
     SettingsService(db).set("data.watch_enabled", True)
@@ -126,13 +126,21 @@ def start_silent_capture(db: Session, task_id: str) -> dict:
     return serializers.capture_session_out(session)
 
 
+def _present_session(db: Session, session: CaptureSession) -> dict:
+    """Serialize a session, refreshing progress on every non-terminal read."""
+    if session.stage not in TERMINAL_STAGES:
+        refresh_session_progress(db, session)
+        db.refresh(session)
+    return serializers.capture_session_out(session)
+
+
 def get_silent_capture(db: Session, task_id: str) -> dict:
     task = db.get(SearchTask, task_id)
     if not task:
         raise NotFoundError("检索任务不存在")
     existing = get_active_session(db, task_id)
     if existing:
-        return serializers.capture_session_out(existing)
+        return _present_session(db, existing)
     latest = (
         db.query(CaptureSession)
         .filter(CaptureSession.task_id == task_id)
@@ -141,7 +149,7 @@ def get_silent_capture(db: Session, task_id: str) -> dict:
     )
     if not latest:
         raise NotFoundError("没有静默抓取会话")
-    return serializers.capture_session_out(latest)
+    return _present_session(db, latest)
 
 
 def cancel_silent_capture(db: Session, task_id: str) -> dict:
@@ -191,6 +199,30 @@ def _count_ai(db: Session, task_id: str) -> tuple[int, int]:
     queued = sum(1 for (status,) in rows if status in (AiStatus.QUEUED, AiStatus.RUNNING))
     completed = sum(1 for (status,) in rows if status in (AiStatus.COMPLETED, AiStatus.CACHED))
     return queued, completed
+
+
+def _pending_parse_count(db: Session, task_id: str) -> int:
+    """Parse jobs still pending or running for papers linked to this task."""
+    paper_ids = {
+        paper_id
+        for (paper_id,) in db.query(SearchTaskPaper.paper_id).filter(SearchTaskPaper.task_id == task_id).all()
+    }
+    if not paper_ids:
+        return 0
+    payloads = (
+        db.query(BackgroundJob.payload)
+        .filter(
+            BackgroundJob.job_type == JobType.PARSE_PAPER,
+            BackgroundJob.status.in_((JobStatus.PENDING, JobStatus.RUNNING)),
+        )
+        .all()
+    )
+    pending = 0
+    for (payload,) in payloads:
+        paper_id = str((payload or {}).get("paper_id") or "")
+        if paper_id in paper_ids:
+            pending += 1
+    return pending
 
 
 def _finish_session(db: Session, session: CaptureSession, stage: str, *, error: str = "") -> None:
@@ -247,13 +279,20 @@ def tick_wait_or_scan(db: Session, session: CaptureSession, *, now: float | None
 
 
 def refresh_session_progress(db: Session, session: CaptureSession, import_job: ImportJob | None = None) -> None:
-    """Copy import totals and task AI counts onto the session.
+    """Copy import totals and task parse/AI queue state onto the session.
 
-    Import progress uses 35–75%. Queued or running AI stays in ai_queued (75–95%).
-    Otherwise the session becomes ready_for_review at 100%. Papers are never auto-included.
+    While the import job is open, processed/total maps onto 35–75%.
+    After it completes, pending parse jobs or queued/running AI stay in
+    ai_queued (status running, finished_at cleared) so their workers can
+    finish. A later read advances to ready_for_review once those queues
+    drain. Terminal stages keep their stage and status; only counts update.
+    Papers are never auto-included, and parse/AI are not run inline.
     """
+    db.refresh(session)
     if import_job is None and session.import_job_id:
         import_job = db.get(ImportJob, session.import_job_id)
+    elif import_job is not None:
+        db.refresh(import_job)
     counts = {**DEFAULT_COUNTS, **dict(session.counts or {})}
     if import_job is not None:
         detail = import_job.detail or {}
@@ -261,7 +300,6 @@ def refresh_session_progress(db: Session, session: CaptureSession, import_job: I
         counts["duplicates"] = int(import_job.duplicates or 0)
         counts["failed"] = int(import_job.failed or 0)
         counts["skipped"] = int(detail.get("skipped") or 0)
-        session.progress = map_import_progress(int(import_job.processed or 0), int(import_job.total or 0))
     refresh_counters(db, session.task_id)
     task = db.get(SearchTask, session.task_id)
     if task is not None:
@@ -270,19 +308,25 @@ def refresh_session_progress(db: Session, session: CaptureSession, import_job: I
     counts["ai_queued"] = ai_queued
     counts["ai_completed"] = ai_completed
     session.counts = counts
+    if session.stage in TERMINAL_STAGES:
+        db.commit()
+        return
     if import_job is not None and import_job.status == JobStatus.FAILED:
+        session.progress = map_import_progress(int(import_job.processed or 0), int(import_job.total or 0))
         session.stage = CaptureStage.FAILED
         session.status = JobStatus.FAILED
         session.error_message = session.error_message or "导入失败"
         session.message = STAGE_MESSAGES[CaptureStage.FAILED]
         session.finished_at = utcnow()
+    elif import_job is not None and import_job.status != JobStatus.COMPLETED:
+        session.progress = map_import_progress(int(import_job.processed or 0), int(import_job.total or 0))
     elif import_job is not None and import_job.status == JobStatus.COMPLETED:
-        if ai_queued > 0:
+        if _pending_parse_count(db, session.task_id) or ai_queued > 0:
             total = ai_queued + ai_completed
             session.stage = CaptureStage.AI_QUEUED
             session.status = JobStatus.RUNNING
             session.finished_at = None
-            session.progress = round(75.0 + 20.0 * (ai_completed / total), 1)
+            session.progress = round(75.0 + 20.0 * (ai_completed / total), 1) if total else 75.0
             session.message = STAGE_MESSAGES[CaptureStage.AI_QUEUED]
         else:
             session.stage = CaptureStage.READY_FOR_REVIEW
@@ -345,7 +389,10 @@ def run_silent_capture_session(
     sleep_fn: Callable[[float], None] = time.sleep,
     max_wait_loops: int | None = None,
 ) -> None:
-    """Wait for import files, scan them inline, then aggregate AI progress."""
+    """Wait for import files, scan them inline, then aggregate parse/AI progress.
+
+    Pending parse and AI jobs stay queued for their own workers.
+    """
     from app.tasks.handlers import JobCancelled
 
     session = db.get(CaptureSession, session_id)
