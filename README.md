@@ -110,13 +110,15 @@
 ```bash
 cd 知网系统
 ./scripts/setup.sh      # 创建 .venv、安装依赖、构建前端、初始化数据库
-./scripts/start.sh      # 启动 http://127.0.0.1:8000
+./scripts/start.sh      # 启动 http://127.0.0.1:8000（默认自动打开浏览器）
 ```
 
-或自动打开浏览器：
+macOS 也可在 Finder 中双击根目录的 `start.command`（等价于 `OPEN_BROWSER=1 ./scripts/start.sh`）。
+
+不打开浏览器时：
 
 ```bash
-OPEN_BROWSER=1 ./scripts/start.sh
+OPEN_BROWSER=0 ./scripts/start.sh
 ```
 
 ### Windows 一键启动
@@ -126,6 +128,20 @@ OPEN_BROWSER=1 ./scripts/start.sh
 ```bat
 scripts\start.bat
 ```
+
+启动后会打开 `http://127.0.0.1:8000`；数据目录与导入目录路径会在终端中打印。按 **Ctrl+C** 停止服务。
+
+### 静默抓取（知网官方导出 → 本地入库）
+
+在已启动本地服务的前提下，推荐流程：
+
+1. **设置 → 知网接入**：填写**账号标识**（仅本机记录，不保存密码），并设置**导入/监听目录**（默认可用 `data/imports/`）。
+2. **文献检索**：新建任务，填写**文献来源**与**发表时间段**，生成检索条件单。
+3. 在任务详情点击 **「静默抓取」**：系统进入等待状态；请自行在[知网官网](https://www.cnki.net)登录，按条件单检索，并使用官方「导出题录 / 下载全文」到上述导入目录（本系统不会自动登录或绕过验证）。
+4. 将官网导出的 RIS/BibTeX/EndNote 或下载的 PDF/CAJ 放入导入目录；后台会自动扫描、按任务条件过滤并关联题录/全文。
+5. 静默抓取进度完成后，到 **「待审核」** 人工确认，点击 **「入库」** 才进入正式文献库（不会自动入库）。
+
+一键启动脚本：**Windows** 用 `scripts\start.bat`；**macOS / Linux** 用 `./scripts/start.sh` 或 `start.command`。
 
 ### 开发模式（前后端热更新）
 
@@ -261,6 +277,8 @@ CNKI_DATA_DIR=/path/to/data .venv/bin/alembic -c backend/alembic.ini upgrade hea
 1. 系统生成检索条件单，告知在知网官方高级检索中如何填写“文献来源”和“主题”。
 2. 用户在官方页面检索，使用官方“导出/参考文献”功能导出 RIS / BibTeX / EndNote。
 3. 系统导入题录，按任务条件过滤并去重。
+
+**静默抓取**是在此模式上的任务级编排：在 **设置 → 知网接入** 配置账号标识与导入目录后，检索任务可启动静默抓取，系统在后台监听导入目录中的官方导出文件，按任务的来源与时间段过滤，并在进度完成后等待人工审核入库。全程不自动登录知网、不绕过验证码、不调用未确认的私有接口。
 
 不会自动登录知网、不会绕过验证码、不会猜测私有接口地址。
 
@@ -423,6 +441,7 @@ Electron 主进程
 ├─ docs/                # 架构、API、验收、测试、打包、进度与截图
 ├─ examples/            # 明确标注的示例 RIS 与 PDF
 ├─ scripts/             # 一键启动 / 开发 / 迁移辅助
+├─ start.command        # macOS Finder 双击启动（可选）
 ├─ pyproject.toml
 ├─ .env.example
 └─ README.md
