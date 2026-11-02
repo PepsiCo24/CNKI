@@ -46,6 +46,7 @@ DEFAULT_SETTINGS: dict[str, object] = {
     "cnki.account_username": "",
     "cnki.account_institution": "",
     "cnki.account_note": "",
+    "cnki.capture_wait_timeout": 1800,
     "cnki.auto_import_downloads": True,
     "cnki.authorized_enabled": False,
     "cnki.authorized_base_url": "",

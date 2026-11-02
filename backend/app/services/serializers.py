@@ -9,6 +9,7 @@ from app.models import (
     AiAnalysisJob,
     AiAnalysisResult,
     BackgroundJob,
+    CaptureSession,
     ImportJob,
     InnovationItem,
     Paper,
@@ -359,4 +360,22 @@ def log_out(log: TaskLog) -> dict[str, Any]:
         "message": log.message,
         "detail": log.detail or {},
         "created_at": iso(log.created_at),
+    }
+
+
+def capture_session_out(session: CaptureSession) -> dict[str, Any]:
+    return {
+        "id": session.id,
+        "task_id": session.task_id,
+        "status": session.status,
+        "stage": session.stage,
+        "progress": session.progress,
+        "counts": session.counts or {},
+        "message": session.message,
+        "error_message": session.error_message,
+        "import_job_id": session.import_job_id,
+        "wait_timeout_seconds": session.wait_timeout_seconds,
+        "started_at": iso(session.started_at),
+        "finished_at": iso(session.finished_at),
+        "updated_at": iso(session.updated_at),
     }
