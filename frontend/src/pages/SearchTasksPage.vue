@@ -2,8 +2,8 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { importsApi, tasksApi, type TaskPayload } from '@/api'
-import type { PaperSummary, RetrievalGuide, SearchTask } from '@/types'
+import { importsApi, settingsApi, tasksApi, type TaskPayload } from '@/api'
+import type { CaptureCounts, CaptureSession, PaperSummary, RetrievalGuide, SearchTask } from '@/types'
 import PageHeader from '@/components/PageHeader.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import EmptyState from '@/components/EmptyState.vue'
@@ -31,9 +31,34 @@ const paperPage = ref(1)
 const taskLoading = ref(false)
 const metadataInput = ref<HTMLInputElement | null>(null)
 const importBusy = ref(false)
+const captureSession = ref<CaptureSession | null>(null)
+const captureBusy = ref(false)
+const captureTerminalNotified = ref(false)
+let capturePolling: number | null = null
 const pollTimer = window.setInterval(() => {
   if (detailVisible.value) refreshDetail(true)
 }, 5000)
+
+const CAPTURE_TERMINAL_STAGES = new Set(['ready_for_review', 'timed_out', 'cancelled', 'failed'])
+const EMPTY_CAPTURE_COUNTS: CaptureCounts = {
+  discovered: 0,
+  imported: 0,
+  skipped: 0,
+  duplicates: 0,
+  failed: 0,
+  ai_queued: 0,
+  ai_completed: 0,
+}
+const CAPTURE_STAGE_LABELS: Record<string, string> = {
+  waiting_files: '等待文件',
+  scanning: '扫描目录',
+  importing: '导入过滤',
+  ai_queued: 'AI 排队',
+  ready_for_review: '待审核',
+  timed_out: '已超时',
+  cancelled: '已取消',
+  failed: '失败',
+}
 
 const dateRange = ref<[string, string] | null>(null)
 const form = reactive<TaskPayload>({
@@ -77,6 +102,33 @@ const statusCounts = computed(() => {
   return counts
 })
 
+const captureActive = computed(() => {
+  const stage = captureSession.value?.stage
+  return Boolean(stage && !CAPTURE_TERMINAL_STAGES.has(stage))
+})
+
+const captureCounts = computed(() => ({
+  ...EMPTY_CAPTURE_COUNTS,
+  ...(captureSession.value?.counts || {}),
+}))
+
+const captureStageLabel = computed(() => {
+  const stage = captureSession.value?.stage || ''
+  return CAPTURE_STAGE_LABELS[stage] || stage || '静默抓取'
+})
+
+const captureProgress = computed(() =>
+  Math.max(0, Math.min(100, Math.round(Number(captureSession.value?.progress) || 0))),
+)
+
+const captureProgressStatus = computed<'' | 'success' | 'exception' | 'warning'>(() => {
+  const stage = captureSession.value?.stage
+  if (stage === 'ready_for_review') return 'success'
+  if (stage === 'failed') return 'exception'
+  if (stage === 'timed_out' || stage === 'cancelled') return 'warning'
+  return ''
+})
+
 function resetForm() {
   Object.assign(form, {
     name: '',
@@ -118,6 +170,10 @@ function openEdit() {
 watch(dateRange, (value) => {
   form.start_date = value?.[0] || null
   form.end_date = value?.[1] || null
+})
+
+watch(detailVisible, (visible) => {
+  if (!visible) stopCapturePolling()
 })
 
 async function loadTasks() {
@@ -177,6 +233,9 @@ async function submitEdit() {
 }
 
 async function openDetail(taskId: string) {
+  stopCapturePolling()
+  captureSession.value = null
+  captureTerminalNotified.value = false
   activeTaskId.value = taskId
   detailVisible.value = true
   currentTask.value = null
@@ -288,16 +347,102 @@ async function onMetadataFile(event: Event) {
   }
 }
 
-async function scanFolder() {
-  if (!currentTask.value) return
-  importBusy.value = true
-  try {
-    await importsApi.scan(null, currentTask.value.id)
-    ElMessage.success('已加入目录扫描队列，可在“下载与导入”查看进度')
-    await refreshDetail()
-  } finally {
-    importBusy.value = false
+function stopCapturePolling() {
+  if (capturePolling != null) {
+    window.clearInterval(capturePolling)
+    capturePolling = null
   }
+}
+
+function startCapturePolling() {
+  stopCapturePolling()
+  capturePolling = window.setInterval(() => {
+    pollCaptureSession()
+  }, 1500)
+}
+
+function applyCaptureSession(session: CaptureSession) {
+  captureSession.value = session
+  if (!CAPTURE_TERMINAL_STAGES.has(session.stage)) return
+  stopCapturePolling()
+  if (captureTerminalNotified.value) return
+  captureTerminalNotified.value = true
+  if (session.stage === 'ready_for_review') {
+    ElMessage.success(session.message || '本轮导入完成，可前往人工审核')
+  } else if (session.stage === 'timed_out') {
+    ElMessage.warning(session.message || '等待超时，已保留已导入数据')
+  } else if (session.stage === 'failed') {
+    ElMessage.error(session.error_message || session.message || '静默抓取失败')
+  }
+  refreshDetail(true)
+  loadTasks()
+}
+
+async function pollCaptureSession() {
+  const id = currentTask.value?.id || activeTaskId.value
+  if (!id) return
+  try {
+    const session = await tasksApi.silentCaptureGet(id)
+    applyCaptureSession(session)
+  } catch {
+    stopCapturePolling()
+  }
+}
+
+async function startSilentCapture() {
+  if (!currentTask.value) return
+  let username = ''
+  try {
+    const settings = await settingsApi.get()
+    username = String(settings.values['cnki.account_username'] || '').trim()
+  } catch {
+    return
+  }
+  if (!username) {
+    try {
+      await ElMessageBox.confirm(
+        '请先在设置 → 知网接入中填写账号标识，再启动静默抓取。系统不会自动登录知网。',
+        '未配置知网账号',
+        { type: 'warning', confirmButtonText: '去设置', cancelButtonText: '取消' },
+      )
+      await router.push('/settings')
+    } catch {
+      /* dismissed */
+    }
+    return
+  }
+  captureBusy.value = true
+  captureTerminalNotified.value = false
+  try {
+    const session = await tasksApi.silentCaptureStart(currentTask.value.id)
+    applyCaptureSession(session)
+    if (!CAPTURE_TERMINAL_STAGES.has(session.stage)) startCapturePolling()
+    await refreshDetail()
+    await loadTasks()
+  } catch {
+    /* handled globally */
+  } finally {
+    captureBusy.value = false
+  }
+}
+
+async function cancelSilentCapture() {
+  if (!currentTask.value) return
+  try {
+    const session = await tasksApi.silentCaptureCancel(currentTask.value.id)
+    stopCapturePolling()
+    captureTerminalNotified.value = true
+    captureSession.value = session
+    ElMessage.success('已取消静默抓取')
+    await refreshDetail()
+    await loadTasks()
+  } catch {
+    /* handled globally */
+  }
+}
+
+function goReview() {
+  router.push('/review')
 }
 
 async function copyConditions() {
@@ -346,6 +491,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   window.clearInterval(pollTimer)
+  stopCapturePolling()
   window.removeEventListener('keydown', handleEsc)
 })
 
@@ -515,7 +661,7 @@ function handleEsc(event: KeyboardEvent) {
         <div class="flex w-full items-center gap-3 pr-4">
           <div class="min-w-0">
             <div class="truncate text-[15px] font-semibold">{{ currentTask?.name || '检索任务' }}</div>
-            <div class="mt-0.5 text-[11px] text-slate-400">检索条件单 · 题录导入 · 本地全文接管</div>
+            <div class="mt-0.5 text-[11px] text-slate-400">静默抓取 · 检索条件单 · 题录导入</div>
           </div>
           <div class="ml-auto flex items-center gap-2">
             <StatusTag v-if="currentTask" type="task" :status="currentTask.status" />
@@ -534,25 +680,56 @@ function handleEsc(event: KeyboardEvent) {
           </div>
 
           <div class="flex flex-wrap gap-2">
-            <el-button type="primary" size="small" :disabled="currentTask.status === 'running'" @click="runTask()">
+            <el-button type="primary" size="small" :loading="captureBusy" @click="startSilentCapture">
+              <el-icon class="mr-1"><Download /></el-icon>静默抓取
+            </el-button>
+            <el-button size="small" :disabled="currentTask.status === 'running'" @click="runTask()">
               <el-icon class="mr-1"><VideoPlay /></el-icon>生成条件单 / 启动
             </el-button>
             <el-button size="small" :disabled="currentTask.status !== 'running'" @click="pauseTask">暂停</el-button>
             <el-button size="small" :disabled="currentTask.status !== 'paused'" @click="resumeTask">继续</el-button>
             <el-button size="small" :disabled="['cancelled', 'completed'].includes(currentTask.status)" @click="cancelTask">取消</el-button>
             <el-button size="small" :disabled="!['failed', 'cancelled', 'awaiting_import'].includes(currentTask.status)" @click="retryTask">重试</el-button>
-            <el-button size="small" type="primary" plain :loading="importBusy" @click="triggerMetadataImport">
+            <el-button size="small" plain :loading="importBusy" @click="triggerMetadataImport">
               <el-icon class="mr-1"><Upload /></el-icon>导入官方题录
-            </el-button>
-            <el-button size="small" :loading="importBusy" @click="scanFolder">
-              <el-icon class="mr-1"><FolderOpened /></el-icon>抓取入库（下载目录）
             </el-button>
             <input ref="metadataInput" type="file" accept=".ris,.bib,.enw,.csv,.txt" class="hidden" @change="onMetadataFile" />
           </div>
 
+          <section v-if="captureSession" class="panel p-4">
+            <div class="mb-2 flex items-start justify-between gap-2">
+              <div class="min-w-0">
+                <div class="section-title">静默抓取进度</div>
+                <div class="mt-0.5 text-[11px] text-slate-400">{{ captureStageLabel }} · {{ captureSession.message || '正在处理' }}</div>
+              </div>
+              <el-button v-if="captureActive" size="small" @click="cancelSilentCapture">取消</el-button>
+              <el-button v-else-if="captureSession.stage === 'ready_for_review'" size="small" type="primary" @click="goReview">
+                前往审核
+              </el-button>
+            </div>
+            <el-progress :percentage="captureProgress" :stroke-width="8" :status="captureProgressStatus" />
+            <div class="mt-2 flex flex-wrap gap-1.5">
+              <span class="chip">发现 {{ captureCounts.discovered }}</span>
+              <span class="chip">导入 {{ captureCounts.imported }}</span>
+              <span class="chip">跳过 {{ captureCounts.skipped }}</span>
+              <span class="chip">重复 {{ captureCounts.duplicates }}</span>
+              <span class="chip">失败 {{ captureCounts.failed }}</span>
+              <span class="chip">AI 排队 {{ captureCounts.ai_queued }}</span>
+              <span class="chip">AI 完成 {{ captureCounts.ai_completed }}</span>
+            </div>
+            <el-alert
+              v-if="captureSession.error_message"
+              class="mt-2"
+              type="error"
+              :closable="false"
+              show-icon
+              :title="captureSession.error_message"
+            />
+          </section>
+
           <el-alert v-if="currentTask.error_message" type="error" :closable="false" show-icon :title="currentTask.error_message" />
           <div class="rounded-md border border-dashed px-3 py-2 text-[11px] leading-5 text-slate-500" :style="{ borderColor: 'var(--app-border)' }">
-            抓取入库说明：在知网官方页面登录，按条件单检索并使用官方导出/下载；系统自动读取导入目录中的题录与全文并按本任务过滤入库。
+            静默抓取：在知网官方页面登录，按条件单检索并使用官方导出/下载到导入目录；系统在后台等待并按本任务过滤入库。
             系统不会自动登录知网、绕过验证码或调用未授权接口。
           </div>
 

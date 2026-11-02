@@ -3,6 +3,7 @@ import type {
   AiJob,
   Analysis,
   BackgroundJob,
+  CaptureSession,
   DashboardData,
   ImportJob,
   InnovationItem,
@@ -106,6 +107,12 @@ export const tasksApi = {
   logs: (id: string) => http.get<never, { items: any[] }>(`/search-tasks/${id}/logs`),
   associate: (id: string, paperIds: string[]) =>
     http.post<never, { added: number }>(`/search-tasks/${id}/papers`, { paper_ids: paperIds }),
+  silentCaptureStart: (id: string) =>
+    http.post<never, CaptureSession>(`/search-tasks/${id}/silent-capture`),
+  silentCaptureGet: (id: string) =>
+    http.get<never, CaptureSession>(`/search-tasks/${id}/silent-capture`),
+  silentCaptureCancel: (id: string) =>
+    http.post<never, CaptureSession>(`/search-tasks/${id}/silent-capture/cancel`),
 }
 
 export const importsApi = {

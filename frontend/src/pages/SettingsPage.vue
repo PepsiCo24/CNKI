@@ -505,6 +505,9 @@ onMounted(loadAll)
                     {{ accountConfigured ? '已记录账号' : '未配置' }}
                   </span>
                 </div>
+                <div v-if="!accountConfigured" class="mt-1.5 text-[11px] leading-5 text-amber-700 dark:text-amber-300">
+                  未填写账号标识时，文献检索页的「静默抓取」无法启动。请填写后保存；账号密码不会保存在本系统。
+                </div>
                 <div class="mt-2 grid gap-3 sm:grid-cols-2">
                   <el-form-item label="账号标识 / 用户名" class="!mb-0">
                     <el-input v-model="values['cnki.account_username']" placeholder="仅用于本机标识，例如：个人账号 / 机构账号尾号" />

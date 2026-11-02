@@ -192,6 +192,30 @@ export interface ReviewRecord {
   paper_title?: string
 }
 
+export interface CaptureCounts {
+  discovered: number
+  imported: number
+  skipped: number
+  duplicates: number
+  failed: number
+  ai_queued: number
+  ai_completed: number
+}
+
+export interface CaptureSession {
+  id: string
+  task_id: string
+  status: string
+  stage: string
+  progress: number
+  counts: CaptureCounts
+  message: string
+  error_message: string
+  wait_timeout_seconds: number
+  started_at?: string | null
+  finished_at?: string | null
+}
+
 export interface SearchTask {
   id: string
   name: string
