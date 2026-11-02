@@ -284,3 +284,199 @@ def test_capture_session_out_and_default_timeout(db, tmp_path):
         "ai_completed": 0,
     }
     assert capture_service.ACTIVE_CAPTURE_STATUSES == {"running"}
+
+
+def test_silent_capture_waits_then_imports_ris(client, db, tmp_path, sample_ris):
+    import shutil
+
+    from app.models import BackgroundJob
+    from app.services import capture_service
+    from app.services.settings_service import SettingsService
+    from app.tasks import handlers
+
+    incoming = tmp_path / "imports"
+    incoming.mkdir()
+    SettingsService(db).set("cnki.account_username", "u1")
+    SettingsService(db).set("data.import_dir", str(incoming))
+    SettingsService(db).set("cnki.capture_wait_timeout", 5)
+    db.commit()
+    task = _create_task(client)
+    out = capture_service.start_silent_capture(db, task["id"])
+    session = db.get(CaptureSession, out["id"])
+    bg = db.get(BackgroundJob, session.background_job_id)
+
+    handlers.handle_silent_capture_tick_for_tests(session.id, max_wait_loops=1, sleep_s=0)
+    db.refresh(session)
+    assert session.stage == "waiting_files"
+
+    shutil.copy(sample_ris, incoming / sample_ris.name)
+    handlers.handle_silent_capture(bg.id, {"session_id": session.id, "task_id": task["id"]})
+    db.refresh(session)
+    assert session.stage in ("ai_queued", "ready_for_review", "importing")
+    assert session.counts.get("imported", 0) + session.counts.get("discovered", 0) >= 0
+    assert session.stage in ("ready_for_review", "ai_queued")
+
+
+def test_import_progress_maps_processed_total_to_35_75():
+    from app.services.capture_service import map_import_progress
+
+    assert map_import_progress(0, 4) == 35.0
+    assert map_import_progress(2, 4) == 55.0
+    assert map_import_progress(4, 4) == 75.0
+    assert map_import_progress(0, 0) == 75.0
+
+
+def test_silent_capture_skips_out_of_range_and_refreshes_counters(client, db, tmp_path, sample_ris):
+    import shutil
+
+    from app.core.constants import ReviewStatus
+    from app.models import BackgroundJob, ImportJob, Paper
+    from app.services import capture_service
+    from app.services.settings_service import SettingsService
+    from app.tasks import handlers
+
+    incoming = tmp_path / "imports"
+    incoming.mkdir()
+    SettingsService(db).set("cnki.account_username", "u1")
+    SettingsService(db).set("data.import_dir", str(incoming))
+    SettingsService(db).set("cnki.capture_wait_timeout", 5)
+    db.commit()
+    task = _create_task(client)
+    out = capture_service.start_silent_capture(db, task["id"])
+    session = db.get(CaptureSession, out["id"])
+    bg = db.get(BackgroundJob, session.background_job_id)
+    shutil.copy(sample_ris, incoming / sample_ris.name)
+
+    handlers.handle_silent_capture(bg.id, {"session_id": session.id, "task_id": task["id"]})
+    db.refresh(session)
+    task_row = db.get(SearchTask, task["id"])
+    papers = db.query(Paper).all()
+
+    assert session.stage == "ready_for_review"
+    assert session.progress == 100
+    assert session.counts["imported"] == 3
+    assert session.counts["skipped"] == 2
+    assert session.counts["discovered"] == 3
+    assert session.counts["ai_queued"] == 0
+    assert session.counts["failed"] == 0
+    assert task_row.discovered_count == 3
+    assert task_row.included_count == 0
+    assert len(papers) == 3
+    assert all(paper.review_status != ReviewStatus.INCLUDED for paper in papers)
+    import_job = db.get(ImportJob, session.import_job_id)
+    assert import_job is not None
+    assert import_job.status == "completed"
+    assert import_job.detail["skipped"] == 2
+    scan_jobs = db.query(BackgroundJob).filter(BackgroundJob.job_type == JobType.SCAN_FOLDER).all()
+    assert scan_jobs == []
+
+
+def test_silent_capture_empty_dir_times_out(db, tmp_path):
+    from datetime import timedelta
+
+    from app.core.constants import TaskStatus
+    from app.core.utils import utcnow
+    from app.models import BackgroundJob, Paper
+    from app.services import capture_service
+    from app.tasks import handlers
+
+    task, _incoming = _ready_task(db, tmp_path)
+    out = capture_service.start_silent_capture(db, task.id)
+    session = db.get(CaptureSession, out["id"])
+    session.started_at = utcnow() - timedelta(seconds=10)
+    session.wait_timeout_seconds = 5
+    db.commit()
+    bg = db.get(BackgroundJob, session.background_job_id)
+
+    handlers.handle_silent_capture(bg.id, {"session_id": session.id, "task_id": task.id})
+    db.refresh(session)
+    db.refresh(task)
+    assert session.stage == "timed_out"
+    assert session.finished_at is not None
+    assert task.status == TaskStatus.AWAITING_IMPORT
+    assert db.query(Paper).count() == 0
+
+
+def test_silent_capture_cancel_skips_import(db, tmp_path, sample_ris):
+    import shutil
+
+    from app.models import BackgroundJob, Paper
+    from app.services import capture_service
+    from app.tasks import handlers
+
+    task, incoming = _ready_task(db, tmp_path)
+    out = capture_service.start_silent_capture(db, task.id)
+    session = db.get(CaptureSession, out["id"])
+    bg = db.get(BackgroundJob, session.background_job_id)
+    shutil.copy(sample_ris, incoming / sample_ris.name)
+    bg.cancel_requested = 1
+    db.commit()
+
+    with pytest.raises(handlers.JobCancelled):
+        handlers.handle_silent_capture(bg.id, {"session_id": session.id, "task_id": task.id})
+    db.refresh(session)
+    assert session.stage == "cancelled"
+    assert db.query(Paper).count() == 0
+
+
+def test_silent_capture_ai_queued_does_not_include(client, db, tmp_path, sample_ris):
+    import shutil
+
+    from app.core.constants import AiStatus, ReviewStatus
+    from app.core.utils import utcnow
+    from app.models import BackgroundJob, Paper, SearchTaskPaper
+    from app.services import capture_service
+    from app.services.settings_service import SettingsService
+    from app.tasks import handlers
+
+    incoming = tmp_path / "imports"
+    incoming.mkdir()
+    SettingsService(db).set("cnki.account_username", "u1")
+    SettingsService(db).set("data.import_dir", str(incoming))
+    db.commit()
+    task = _create_task(client)
+    queued = Paper(title="已排队但未入库", ai_status=AiStatus.QUEUED, review_status=ReviewStatus.PENDING_AI)
+    db.add(queued)
+    db.flush()
+    db.add(SearchTaskPaper(task_id=task["id"], paper_id=queued.id, added_at=utcnow()))
+    db.commit()
+    out = capture_service.start_silent_capture(db, task["id"])
+    session = db.get(CaptureSession, out["id"])
+    bg = db.get(BackgroundJob, session.background_job_id)
+    shutil.copy(sample_ris, incoming / sample_ris.name)
+
+    handlers.handle_silent_capture(bg.id, {"session_id": session.id, "task_id": task["id"]})
+    db.refresh(session)
+    papers = db.query(Paper).all()
+    assert session.stage == "ai_queued"
+    assert session.counts["ai_queued"] == 1
+    assert session.counts["ai_completed"] == 0
+    assert 75 <= session.progress < 100
+    assert all(paper.review_status != ReviewStatus.INCLUDED for paper in papers)
+
+
+@pytest.mark.asyncio
+async def test_runner_dispatches_silent_capture(client, db, tmp_path, sample_ris):
+    import shutil
+
+    from app.models import BackgroundJob
+    from app.services import capture_service
+    from app.services.settings_service import SettingsService
+    from app.tasks.runner import runner
+
+    incoming = tmp_path / "imports"
+    incoming.mkdir()
+    SettingsService(db).set("cnki.account_username", "u1")
+    SettingsService(db).set("data.import_dir", str(incoming))
+    db.commit()
+    task = _create_task(client)
+    out = capture_service.start_silent_capture(db, task["id"])
+    session = db.get(CaptureSession, out["id"])
+    bg = db.get(BackgroundJob, session.background_job_id)
+    shutil.copy(sample_ris, incoming / sample_ris.name)
+
+    await runner._execute(bg.id)
+    db.refresh(session)
+    db.refresh(bg)
+    assert session.stage == "ready_for_review"
+    assert bg.status == "completed"

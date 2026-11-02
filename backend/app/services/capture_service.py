@@ -1,18 +1,24 @@
 """Silent local-ingest capture sessions (no CNKI login or headless scrape)."""
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
+from datetime import timezone
 from pathlib import Path
 
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.core.constants import CaptureStage, JobStatus, JobType, TaskStatus
+from app.core.constants import AiStatus, CaptureStage, JobStatus, JobType, TaskStatus
 from app.core.errors import NotFoundError, ValidationAppError
 from app.core.utils import utcnow
-from app.models import BackgroundJob, CaptureSession, SearchTask
+from app.models import BackgroundJob, CaptureSession, ImportJob, Paper, SearchTask, SearchTaskPaper
 from app.services import serializers
+from app.services.file_service import list_watchable_files
+from app.services.import_service import scan_directory
 from app.services.log_service import log_event
 from app.services.settings_service import SettingsService
+from app.services.task_service import refresh_counters
 from app.tasks.queue import cancel_job, enqueue_job
 
 ACTIVE_CAPTURE_STATUSES = {"running"}
@@ -158,3 +164,204 @@ def cancel_silent_capture(db: Session, task_id: str) -> dict:
     db.commit()
     db.refresh(session)
     return serializers.capture_session_out(session)
+
+
+def map_import_progress(processed: int, total: int) -> float:
+    """Map ImportJob.processed/total onto the importing band, 35–75%."""
+    if total <= 0:
+        return 75.0
+    ratio = max(0.0, min(1.0, float(processed) / float(total)))
+    return round(35.0 + 40.0 * ratio, 1)
+
+
+def _wait_deadline(session: CaptureSession) -> float:
+    started = session.started_at or utcnow()
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    return started.timestamp() + int(session.wait_timeout_seconds or 0)
+
+
+def _count_ai(db: Session, task_id: str) -> tuple[int, int]:
+    rows = (
+        db.query(Paper.ai_status)
+        .join(SearchTaskPaper, SearchTaskPaper.paper_id == Paper.id)
+        .filter(SearchTaskPaper.task_id == task_id, Paper.is_deleted.is_(False))
+        .all()
+    )
+    queued = sum(1 for (status,) in rows if status in (AiStatus.QUEUED, AiStatus.RUNNING))
+    completed = sum(1 for (status,) in rows if status in (AiStatus.COMPLETED, AiStatus.CACHED))
+    return queued, completed
+
+
+def _finish_session(db: Session, session: CaptureSession, stage: str, *, error: str = "") -> None:
+    session.stage = stage
+    session.message = STAGE_MESSAGES[stage]
+    session.finished_at = utcnow()
+    if error:
+        session.error_message = error[:4000]
+    if stage == CaptureStage.CANCELLED:
+        session.status = JobStatus.CANCELLED
+    elif stage == CaptureStage.FAILED:
+        session.status = JobStatus.FAILED
+    else:
+        session.status = JobStatus.COMPLETED
+    task = db.get(SearchTask, session.task_id)
+    if task and task.status == TaskStatus.RUNNING and stage in (
+        CaptureStage.CANCELLED,
+        CaptureStage.TIMED_OUT,
+        CaptureStage.FAILED,
+        CaptureStage.READY_FOR_REVIEW,
+    ):
+        task.status = TaskStatus.AWAITING_IMPORT
+    if stage == CaptureStage.TIMED_OUT:
+        log_event(db, "静默抓取等待超时", task_id=session.task_id, detail={"session_id": session.id}, commit=False)
+    elif stage == CaptureStage.CANCELLED:
+        log_event(db, "静默抓取已取消", task_id=session.task_id, detail={"session_id": session.id}, commit=False)
+    db.commit()
+
+
+def tick_wait_or_scan(db: Session, session: CaptureSession, *, now: float | None = None) -> str:
+    """One wait check. Returns waiting, scan, timed_out, or cancelled.
+
+    An empty import directory stays in waiting_files until timeout or cancel.
+    """
+    db.refresh(session)
+    if session.stage == CaptureStage.CANCELLED:
+        return "cancelled"
+    bg = db.get(BackgroundJob, session.background_job_id) if session.background_job_id else None
+    if bg and bg.cancel_requested:
+        _finish_session(db, session, CaptureStage.CANCELLED)
+        return "cancelled"
+    files = list_watchable_files(resolve_import_dir(db))
+    if files:
+        return "scan"
+    moment = time.time() if now is None else now
+    if moment > _wait_deadline(session):
+        _finish_session(db, session, CaptureStage.TIMED_OUT)
+        return "timed_out"
+    session.stage = CaptureStage.WAITING_FILES
+    session.progress = min(14.0, float(session.progress or 0) + 0.5)
+    session.message = STAGE_MESSAGES[CaptureStage.WAITING_FILES]
+    db.commit()
+    return "waiting"
+
+
+def refresh_session_progress(db: Session, session: CaptureSession, import_job: ImportJob | None = None) -> None:
+    """Copy import totals and task AI counts onto the session.
+
+    Import progress uses 35–75%. Queued or running AI stays in ai_queued (75–95%).
+    Otherwise the session becomes ready_for_review at 100%. Papers are never auto-included.
+    """
+    if import_job is None and session.import_job_id:
+        import_job = db.get(ImportJob, session.import_job_id)
+    counts = {**DEFAULT_COUNTS, **dict(session.counts or {})}
+    if import_job is not None:
+        detail = import_job.detail or {}
+        counts["imported"] = int(import_job.imported or 0)
+        counts["duplicates"] = int(import_job.duplicates or 0)
+        counts["failed"] = int(import_job.failed or 0)
+        counts["skipped"] = int(detail.get("skipped") or 0)
+        session.progress = map_import_progress(int(import_job.processed or 0), int(import_job.total or 0))
+    refresh_counters(db, session.task_id)
+    task = db.get(SearchTask, session.task_id)
+    if task is not None:
+        counts["discovered"] = int(task.discovered_count or 0)
+    ai_queued, ai_completed = _count_ai(db, session.task_id)
+    counts["ai_queued"] = ai_queued
+    counts["ai_completed"] = ai_completed
+    session.counts = counts
+    if import_job is not None and import_job.status == JobStatus.FAILED:
+        session.stage = CaptureStage.FAILED
+        session.status = JobStatus.FAILED
+        session.error_message = session.error_message or "导入失败"
+        session.message = STAGE_MESSAGES[CaptureStage.FAILED]
+        session.finished_at = utcnow()
+    elif import_job is not None and import_job.status == JobStatus.COMPLETED:
+        if ai_queued > 0:
+            total = ai_queued + ai_completed
+            session.stage = CaptureStage.AI_QUEUED
+            session.status = JobStatus.RUNNING
+            session.finished_at = None
+            session.progress = round(75.0 + 20.0 * (ai_completed / total), 1)
+            session.message = STAGE_MESSAGES[CaptureStage.AI_QUEUED]
+        else:
+            session.stage = CaptureStage.READY_FOR_REVIEW
+            session.status = JobStatus.COMPLETED
+            session.progress = 100.0
+            session.finished_at = utcnow()
+            session.message = STAGE_MESSAGES[CaptureStage.READY_FOR_REVIEW]
+            if task and task.status == TaskStatus.RUNNING:
+                task.status = TaskStatus.AWAITING_IMPORT
+            log_event(
+                db,
+                "静默抓取完成，可前往人工审核",
+                task_id=session.task_id,
+                detail={"session_id": session.id},
+                commit=False,
+            )
+    db.commit()
+
+
+def _run_inline_scan(db: Session, session: CaptureSession) -> None:
+    """Persist an ImportJob and scan in-process. Does not enqueue scan_folder."""
+    session_id = session.id
+    import_dir = resolve_import_dir(db)
+    session.stage = CaptureStage.SCANNING
+    session.progress = 20
+    session.message = STAGE_MESSAGES[CaptureStage.SCANNING]
+    db.commit()
+
+    job = ImportJob(
+        job_type="folder_scan",
+        status=JobStatus.PENDING,
+        source_path=str(import_dir),
+        task_id=session.task_id,
+        detail={"origin": "silent_capture"},
+    )
+    db.add(job)
+    db.flush()
+    session.import_job_id = job.id
+    session.stage = CaptureStage.IMPORTING
+    session.progress = 35
+    session.message = STAGE_MESSAGES[CaptureStage.IMPORTING]
+    db.commit()
+    try:
+        scan_directory(db, job.id, str(import_dir), session.task_id)
+    except Exception as exc:
+        db.rollback()
+        failed = db.get(CaptureSession, session_id)
+        if failed and failed.stage not in TERMINAL_STAGES:
+            _finish_session(db, failed, CaptureStage.FAILED, error=str(exc))
+        raise
+    db.refresh(session)
+    db.refresh(job)
+    refresh_session_progress(db, session, job)
+
+
+def run_silent_capture_session(
+    db: Session,
+    session_id: str,
+    *,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    max_wait_loops: int | None = None,
+) -> None:
+    """Wait for import files, scan them inline, then aggregate AI progress."""
+    from app.tasks.handlers import JobCancelled
+
+    session = db.get(CaptureSession, session_id)
+    if session is None:
+        raise NotFoundError("没有静默抓取会话")
+    loops = 0
+    while True:
+        action = tick_wait_or_scan(db, session)
+        if action == "cancelled":
+            raise JobCancelled()
+        if action == "timed_out":
+            return
+        if action == "scan":
+            break
+        loops += 1
+        if max_wait_loops is not None and loops >= max_wait_loops:
+            return
+        sleep_fn(2)
+    _run_inline_scan(db, session)

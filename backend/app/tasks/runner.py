@@ -198,6 +198,8 @@ class JobRunner:
             elif job_type == JobType.BACKUP:
                 payload["job_id"] = job_id
                 await asyncio.to_thread(handlers.handle_backup, payload)
+            elif job_type == JobType.SILENT_CAPTURE:
+                await asyncio.to_thread(handlers.handle_silent_capture, job_id, payload)
             else:
                 raise ValueError(f"未知任务类型：{job_type}")
             self._finish(job_id, JobStatus.COMPLETED, "执行完成")

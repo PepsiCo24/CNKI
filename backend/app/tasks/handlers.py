@@ -19,6 +19,7 @@ from app.database.fts import index_paper, rebuild_all
 from app.database.session import SessionLocal
 from app.models import AiAnalysisJob, BackgroundJob, ImportJob, Paper, PaperFile, PaperText
 from app.parsers.pdf_parser import extract_document
+from app.services import capture_service
 from app.services.analysis_service import request_analysis
 from app.services.export_service import create_backup, export_papers
 from app.services.file_service import _write_metadata_sidecar
@@ -271,6 +272,34 @@ def handle_rebuild_index(payload: dict[str, Any]) -> None:
         if job:
             job.message = f"索引已重建（{count} 篇）"
             db.commit()
+    finally:
+        db.close()
+
+
+def handle_silent_capture(job_id: str, payload: dict[str, Any]) -> None:
+    session_id = str((payload or {}).get("session_id") or "")
+    if not session_id:
+        logger.warning("silent capture skipped: missing session_id on job %s", job_id)
+        return
+    db: Session = SessionLocal()
+    try:
+        capture_service.run_silent_capture_session(db, session_id)
+    finally:
+        db.close()
+
+
+def handle_silent_capture_tick_for_tests(session_id: str, max_wait_loops: int = 1, sleep_s: float = 0) -> None:
+    """Stop an empty-directory wait early so tests can assert ``waiting_files``."""
+    import time
+
+    db: Session = SessionLocal()
+    try:
+        capture_service.run_silent_capture_session(
+            db,
+            session_id,
+            sleep_fn=lambda _seconds: time.sleep(sleep_s),
+            max_wait_loops=max_wait_loops,
+        )
     finally:
         db.close()
 
