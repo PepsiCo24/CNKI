@@ -20,3 +20,4 @@ frontend/playwright-report/
 docs/openapi.json.tmp
 
 .superpowers/
+releases/
